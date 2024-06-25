@@ -1,0 +1,37 @@
+---
+# Shares a list of subnets to a given AWS Organization or OU
+
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Share VPC with RAM
+
+Parameters:
+  AWSOrganizationArn:
+    Description: AWS Organization or OU ARN
+    Type: String
+    AllowedPattern: arn:aws:organizations::.*
+
+  SubnetsArnList:
+    Description: |
+      Comma separated list of ARNs of the 6 subnets to share. You can generate this list with:
+        vpc_id=vpc-1234abcd; aws --output text ec2 describe-subnets --query "Subnets[?VpcId=='"$vpc_id"'].SubnetArn" | tr '\t' ','
+    Type: List<String>    
+
+Resources:
+  ShareSubnets:
+    Type: AWS::RAM::ResourceShare
+    Properties:
+      Name: Shared-Subnets
+      AllowExternalPrincipals: No
+      Principals: 
+        - !Ref AWSOrganizationArn
+      ResourceArns:
+        - !Select [ 0, !Ref SubnetsArnList ]
+        - !Select [ 1, !Ref SubnetsArnList ]
+        - !Select [ 2, !Ref SubnetsArnList ]
+        - !Select [ 3, !Ref SubnetsArnList ]
+        - !Select [ 4, !Ref SubnetsArnList ]
+        - !Select [ 5, !Ref SubnetsArnList ]
+

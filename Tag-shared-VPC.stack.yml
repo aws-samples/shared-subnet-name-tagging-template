@@ -1,0 +1,127 @@
+---
+# Tag a shared VPC
+# This templates needs to deployed on every member account.
+
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Tag shared VPCs/subnets
+
+Parameters:
+  IdsToNamesList:
+    Type: String
+    Description: |
+      Pipe separated list of IDs and names. 
+      For example vpc-123|My-Shared-VPC|subnet-234|Private Subnet A|subnet-345|Private SubnetB| .
+      You can copy and paste the output of the following AWS CLI command after filling the vpc_id.
+      This CLI command needs to be run on the account that is sharing the VPC:
+      
+        export AWS_PROFILE=your-network-account-profile ; vpc_id=vpc-1234abcd ; ( aws ec2 describe-vpcs --query "Vpcs[?VpcId=='"$vpc_id"'].[VpcId,Tags[?Key=='Name'].Value]" --output text ; aws ec2 describe-subnets --query "Subnets[?VpcId=='"$vpc_id"'].[SubnetId,Tags[?Key=='Name'].Value]" --output text ) | tr '\n' '|'
+
+
+Resources:
+
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+                - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:*:subnet/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:*:vpc/*
+
+
+  CustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt CustomResourceRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.config import Config
+          import cfnresponse
+          import traceback
+
+          botoconfig=Config(retries={'max_attempts':10,'mode':'standard'})
+          ec2 = boto3.client('ec2', config=botoconfig)
+
+          def handler(event, context):
+            response_payload = {}
+            response_status = cfnresponse.FAILED
+            physical_resource_id = 'tags'
+
+            try:
+              if event['RequestType'] == 'Delete':
+                # Nothing to delete, keep as is
+                response_status = cfnresponse.SUCCESS
+
+              elif event['RequestType'] in ('Create','Update'):
+                mappings = event['ResourceProperties']['IdsToNamesList']
+                mappings_list = mappings.split('|')
+                # Iterate through the pairs of vpc or subnet-IDs and names, all separated with |
+                for id,name in zip(mappings_list[::2], mappings_list[1::2]):
+                  if not id or not name:
+                    continue
+                  print(f'Tagging {id} with the Name {name}...')
+                  try:
+                    ec2.create_tags(
+                      Resources=[id],
+                      Tags=[
+                        {
+                          'Key':'Name',
+                          'Value': name
+                        }
+                      ]
+                    )
+                  except Exception as e:
+                    print(f'Could not tag {id} with Name {name}')
+                    # You can optionally add a "raise e" here if you want the stack 
+                    # to fail. However this is not done by default as not all subnets
+                    # may be shared, so if the Parameter includes those subnets, the
+                    # stack would fail
+                response_status = cfnresponse.SUCCESS
+
+            except Exception as e:
+              print('ERROR: Caught exception:')
+              print(e)
+              traceback.print_exc()
+            finally:
+              print('Sending cfn response')
+              cfnresponse.send(event, context, response_status, response_payload, physical_resource_id)        
+
+
+  CustomResourceLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CustomResourceLambda}
+      RetentionInDays: 7
+
+  TagResources:
+    Type: Custom::TagResources
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambda.Arn
+      IdsToNamesList: !Ref IdsToNamesList
+

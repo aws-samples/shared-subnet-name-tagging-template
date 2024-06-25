@@ -1,0 +1,795 @@
+---
+# CloudFormation template for a simple 3 AZ VPC
+
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: VPC
+
+Parameters:
+    VPCNetwork:
+        Description: Network to assign to the created VPC. Do not include the mask.
+        Type: String
+        Default: 10.0.0.0
+        AllowedPattern: ^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$
+
+    CIDRPrefix:
+        Description: Network/CIDR to assign to the created VPC
+        Type: Number
+        Default: 24
+        AllowedValues:
+          - 24
+          - 22
+          - 19
+
+    VPCName:
+        Description: Text to append to Name tag. Do not include "VPC" in the name.
+        Type: String
+
+    PublicSubnets:
+        Description: Create public subnets and NAT gateway? If this set to "No", consider seeing SSMEndpoints to Yes.
+        Type: String
+        Default: "Yes"
+        AllowedValues:
+          - "Yes"
+          - "No"
+
+    HaveMultiAZNAT:
+        Description: NAT gateway in each AZ?
+        Type: String
+        AllowedValues:
+            - "Yes"
+            - "No"
+        ConstraintDescription: Either yes or no
+        Default: "No"
+
+    VPCFlowLogsRetentionInDays:
+        Description: VPC Flow Log CloudWatch Log Group retention in days
+        Type: Number
+        Default: 7
+        AllowedValues: [ 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653 ]
+
+    SSMEndpoints:
+        Description: Create SSM VPC interface endpoints? This allows using Session Manager to access the instance without a public subnet.
+        Type: String
+        Default: "No"
+        AllowedValues:
+          - "Yes"
+          - "No"
+
+    CreateEC2Instance:
+        Description: Create test EC2 instances? Allows pings, SSH and tcp/udp ports 1234 for 10.0.0.0/8. Connect via SSM.
+        Type: String
+        Default: "No"
+        AllowedValues:
+          - "Yes"
+          - "No"
+
+    AmazonLinux2AMI:
+        Description: Amazon Linux 2 AMI ID SSM parameter
+        Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+        Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+    InstanceType:
+        Description: Instance type to use for the sample client
+        Type: String
+        Default: t3.nano
+
+    VPNIP:
+        Description: (Optional, for site-to-site VPN) VPN IP, if you want to create a customer gateway
+        Type: String
+        Default: ""
+        
+    ASN:
+        Description: (Optional, for site-to-site VPN or DX) VGW ASN, if you want to connect to a DX Private VIF or VPN
+        Type: String
+        Default: ""
+
+
+Rules:
+  # HaveMultiAZNAT should default to No if there are no Public subnets
+  NATOnlyIfThereArePublicSubnet:
+    RuleCondition: !Equals [ !Ref PublicSubnets, "No" ]
+    Assertions:
+      - Assert: !Equals [ !Ref HaveMultiAZNAT, "No" ]
+        AssertDescription: 'Multi AZ NAT gateways are not applicable if there are no public subnets'
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required values
+        Parameters:
+          - VPCName
+          - VPCNetwork
+          - CIDRPrefix
+      - Label:
+          default: Options
+        Parameters:
+          - PublicSubnets
+          - HaveMultiAZNAT          
+          - SSMEndpoints
+          - CreateEC2Instance
+          - InstanceType
+      - Label:
+          default: (Optional) VPN or DX Private VIF configuration
+        Parameters:
+          - VPNIP
+          - ASN          
+    ParameterLabels:
+      VPCName: 
+        default: VPC Name (do not include "vpc")
+      VPCNetwork:
+        default: VPC network, without subnet mask or CIDR
+      CIDRPrefix:
+        default: CIDR prefix
+      PublicSubnets:
+        default: Create public subnets?
+      HaveMultiAZNAT:
+        default: Create NAT GW in every AZ (if creating public subnets)
+      SSMEndpoints:
+        default: Create SSM VPC endpoints, to access EC2 instance without public subnets?
+      CreateEC2Instance:
+        default: Create EC2 instance for ping tests?
+      InstanceType:
+        default: Type of EC2 instance to create
+      VPNIP:
+        default: (Optional) VPN Server IP to connect to (for the Customer Gateway)
+      ASN:
+        default: (Optional) BGP ASN to configure for the VGW.
+
+
+Conditions:
+    MultiAZNAT: !Equals [ !Ref HaveMultiAZNAT, "Yes" ]
+    PublicSubnets: !Equals [ !Ref PublicSubnets, "Yes" ]
+    SSMEndpoints: !Equals [ !Ref SSMEndpoints, "Yes" ]
+    CreateEC2Instance: !Equals [ !Ref CreateEC2Instance, "Yes" ]
+    VPNIP: !Not [ !Equals [ !Ref VPNIP, "" ] ]
+    ASN: !Not [ !Equals [ !Ref ASN, "" ] ]
+    VPNIP&ASN: !And
+      - !Condition 'VPNIP'
+      - !Condition 'ASN'      
+    PublicSubnets&MultiAZNAT: !And
+      - !Condition 'PublicSubnets'
+      - !Condition 'MultiAZNAT'
+
+Mappings:
+  VpcPrefixToSubnet:
+    "24":
+      subnetMask: 27
+      subnetBits: 5 # 32-27
+    "22":
+      subnetMask: 25
+      subnetBits: 7 # 32-25  
+    "19":
+      subnetMask: 22
+      subnetBits: 10 # 32-22
+
+Resources:
+
+    VPC:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: !Sub "${VPCNetwork}/${CIDRPrefix}"
+            EnableDnsSupport: true
+            EnableDnsHostnames: true
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} VPC 
+
+
+  ##################
+  # Public Subnets #
+  ##################
+
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+        Condition: PublicSubnets
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Internet Gateway
+    InternetGatewayAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Condition: PublicSubnets
+        Properties:
+            VpcId: !Ref VPC
+            InternetGatewayId: !Ref InternetGateway
+
+
+    PublicSubnetA:
+        Type: AWS::EC2::Subnet
+        Condition: PublicSubnets
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 0
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 0, "Fn::GetAZs" : "" ]
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet A
+    PublicSubnetB:
+        Type: AWS::EC2::Subnet
+        Condition: PublicSubnets
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 1
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 1, "Fn::GetAZs" : "" ] 
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet B 
+    PublicSubnetC:
+        Type: AWS::EC2::Subnet
+        Condition: PublicSubnets
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 2
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 2, "Fn::GetAZs" : "" ] 
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet C
+
+
+    PublicRouteTable:
+        Type: AWS::EC2::RouteTable
+        Condition: PublicSubnets
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Route table 
+
+
+    PublicRouteDefault:
+        Type: AWS::EC2::Route
+        Condition: PublicSubnets
+        DependsOn: InternetGatewayAttachment
+        Properties:
+            GatewayId: !Ref InternetGateway
+            RouteTableId: !Ref PublicRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+
+ 
+    PublicRouteAssociationA:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Condition: PublicSubnets
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetA
+    PublicRouteAssociationB:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Condition: PublicSubnets
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetB
+    PublicRouteAssociationC:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Condition: PublicSubnets
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetC
+
+
+    NATElasticIPA:
+        Type: AWS::EC2::EIP
+        Condition: PublicSubnets
+        Properties:
+            Domain: vpc
+    NATElasticIPB:
+        Condition: PublicSubnets&MultiAZNAT
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+    NATElasticIPC:
+        Condition: PublicSubnets&MultiAZNAT
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+
+    NATGatewayA:
+        Type: AWS::EC2::NatGateway
+        Condition: PublicSubnets
+        DependsOn: PublicRouteAssociationA
+        Properties:
+            AllocationId: !GetAtt NATElasticIPA.AllocationId
+            SubnetId: !Ref PublicSubnetA
+    NATGatewayB:
+        Type: AWS::EC2::NatGateway
+        Condition: PublicSubnets&MultiAZNAT
+        DependsOn: PublicRouteAssociationB
+        Properties:
+            AllocationId: !GetAtt NATElasticIPB.AllocationId
+            SubnetId: !Ref PublicSubnetB
+    NATGatewayC:
+        Type: AWS::EC2::NatGateway
+        Condition: PublicSubnets&MultiAZNAT
+        DependsOn: PublicRouteAssociationC
+        Properties:
+            AllocationId: !GetAtt NATElasticIPC.AllocationId
+            SubnetId: !Ref PublicSubnetC
+
+
+  ###################
+  # Private Subnets #
+  ###################
+
+    PrivateSubnetA:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 3
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 0, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet A 
+    PrivateSubnetB:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 4
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 1, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet B 
+    PrivateSubnetC:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 5
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 2, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet C 
+
+
+    PrivateRouteTableA:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !If
+                    - PublicSubnets&MultiAZNAT
+                    - !Sub ${VPCName} Private Route table A 
+                    - !Sub ${VPCName} Private Route table
+    PrivateRouteTableB:
+        Condition: PublicSubnets&MultiAZNAT
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Route table B 
+    PrivateRouteTableC:
+        Condition: PublicSubnets&MultiAZNAT
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Route table C 
+
+    PrivateRouteA:
+        Type: AWS::EC2::Route
+        Condition: PublicSubnets
+        Properties:
+            NatGatewayId: !Ref NATGatewayA
+            RouteTableId: !Ref PrivateRouteTableA
+            DestinationCidrBlock: 0.0.0.0/0
+    # Rest only create if the NAT is multi-AZ
+    PrivateRouteB:
+        Type: AWS::EC2::Route
+        Condition: PublicSubnets&MultiAZNAT        
+        Properties:
+            NatGatewayId: !Ref NATGatewayB
+            RouteTableId: !Ref PrivateRouteTableB
+            DestinationCidrBlock: 0.0.0.0/0
+    PrivateRouteC:
+        Type: AWS::EC2::Route
+        Condition: PublicSubnets&MultiAZNAT        
+        Properties:
+            NatGatewayId: !Ref NATGatewayC
+            RouteTableId: !Ref PrivateRouteTableC
+            DestinationCidrBlock: 0.0.0.0/0
+
+
+    PrivateRouteAssociationA:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PrivateRouteTableA
+            SubnetId: !Ref PrivateSubnetA
+    # If it's not MultiAZ, use Route table A for everything :
+    PrivateRouteAssociationB:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableB, !Ref PrivateRouteTableA ]
+            SubnetId: !Ref PrivateSubnetB
+    PrivateRouteAssociationC:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableC, !Ref PrivateRouteTableA ]
+            SubnetId: !Ref PrivateSubnetC
+
+
+#############
+# Flow logs #
+#############
+
+    VPCFlowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            RetentionInDays: !Ref VPCFlowLogsRetentionInDays
+
+    VPCFlowLogRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service: [ vpc-flow-logs.amazonaws.com ]
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: flowlogs-policy
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                        - Effect: Allow
+                          Action:
+                              - 'logs:CreateLogStream'
+                              - 'logs:PutLogEvents'
+                              - 'logs:DescribeLogGroups'
+                              - 'logs:DescribeLogStreams'
+                          Resource: !GetAtt 'VPCFlowLogGroup.Arn'
+
+    VPCFlowLogs:
+        Type: AWS::EC2::FlowLog
+        Properties:
+            DeliverLogsPermissionArn: !GetAtt 'VPCFlowLogRole.Arn'
+            LogDestinationType: cloud-watch-logs
+            LogGroupName: !Ref VPCFlowLogGroup
+            ResourceType: 'VPC'
+            ResourceId: !Ref VPC
+            TrafficType: ALL
+
+
+  #########################
+  # Gateway VPC Endpoints #
+  #########################
+
+    VPCGatewayEndpointS3:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        RouteTableIds:
+          - !Ref PrivateRouteTableA
+          - !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableB, !Ref "AWS::NoValue" ]
+          - !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableC, !Ref "AWS::NoValue" ]
+          - !If [ PublicSubnets, !Ref PublicRouteTable, !Ref "AWS::NoValue" ] 
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+        VpcId: !Ref VPC  
+
+
+    VPCGatewayEndpointDynamoDB:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        RouteTableIds:
+          - !Ref PrivateRouteTableA
+          - !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableB, !Ref "AWS::NoValue" ]
+          - !If [ PublicSubnets&MultiAZNAT, !Ref PrivateRouteTableC, !Ref "AWS::NoValue" ]
+          - !If [ PublicSubnets, !Ref PublicRouteTable, !Ref "AWS::NoValue" ]
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+        VpcId: !Ref VPC  
+
+
+  ###########################
+  # Interface VPC Endpoints #
+  ###########################
+
+    SecurityGroupVPCEndpoint:
+      Type: AWS::EC2::SecurityGroup
+      Condition: SSMEndpoints
+      Properties:
+        GroupDescription: Interface VPC endpoint security group
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          - IpProtocol:  'tcp'
+            FromPort: 443
+            ToPort:  443
+            CidrIp: !Sub "${VPCNetwork}/${CIDRPrefix}"
+            Description: VPC endpoint HTTPS ingress
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    VPCInterfaceEndpointEC2:
+      Type: AWS::EC2::VPCEndpoint
+      Condition: SSMEndpoints
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+        VpcEndpointType: Interface
+        VpcId: !Ref VPC
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref SecurityGroupVPCEndpoint
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PrivateSubnetC
+
+    VPCInterfaceEndpointEC2messages:
+      Type: AWS::EC2::VPCEndpoint
+      Condition: SSMEndpoints
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+        VpcEndpointType: Interface
+        VpcId: !Ref VPC
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref SecurityGroupVPCEndpoint
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PrivateSubnetC
+
+    VPCInterfaceEndpointSSM:
+      Type: AWS::EC2::VPCEndpoint
+      Condition: SSMEndpoints
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+        VpcEndpointType: Interface
+        VpcId: !Ref VPC
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref SecurityGroupVPCEndpoint
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PrivateSubnetC
+
+    VPCInterfaceEndpointSSMMessages:
+      Type: AWS::EC2::VPCEndpoint
+      Condition: SSMEndpoints
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+        VpcEndpointType: Interface
+        VpcId: !Ref VPC
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref SecurityGroupVPCEndpoint
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PrivateSubnetC
+
+#######
+# EC2 #
+#######
+
+    SecurityGroupPingTest:
+      Type: AWS::EC2::SecurityGroup
+      Condition: CreateEC2Instance      
+      Properties:
+        GroupDescription: !Sub ${VPCName} ping test
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8, Description: "Ping test from LAN" }
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+
+    SSMRole:
+      Type: AWS::IAM::Role
+      Condition: CreateEC2Instance
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: [ "ec2.amazonaws.com" ]
+              Action: [ "sts:AssumeRole" ]
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+          # - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy # Target specific log groups if possible
+        Policies:
+        # https://docs.aws.amazon.com/systems-manager/latest/userguide/ssm-agent-minimum-s3-permissions.html
+          - PolicyName: AllowPublicS3Buckets
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                  Resource:
+                    - !Sub arn:aws:s3:::aws-ssm-${AWS::Region}/*
+                    - !Sub arn:aws:s3:::aws-windows-downloads-${AWS::Region}/*
+                    - !Sub arn:aws:s3:::amazon-ssm-${AWS::Region}/*
+                    - !Sub arn:aws:s3:::patch-baseline-snapshot-${AWS::Region}/*
+
+
+    SSMInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Condition: CreateEC2Instance
+      Properties:
+        Roles: [ !Ref SSMRole ]
+
+
+    EC2Instance:
+      Type: AWS::EC2::Instance
+      Condition: CreateEC2Instance
+      Properties:
+        ImageId: !Ref AmazonLinux2AMI
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: !Ref SSMInstanceProfile
+        InstanceInitiatedShutdownBehavior: stop
+        SubnetId: !Ref PrivateSubnetA
+        SecurityGroupIds:
+          - !Ref SecurityGroupPingTest
+        Tags: 
+          - Key: Name
+            Value: !Sub ${VPCName} ping test
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /usr/bin/hostnamectl set-hostname ${VPCName}
+            yum install -y nc
+
+
+#######
+# VPN #
+#######
+
+    CustomerGateway:
+      Type: AWS::EC2::CustomerGateway
+      Condition: VPNIP&ASN
+      Properties:
+        BgpAsn: !Ref ASN
+        IpAddress: !Ref VPNIP
+        Type: ipsec.1
+        Tags:
+          - Key: Name
+            Value: !Sub ${VPCName} Customer Gateway      
+
+
+    VirtualPrivateGateway:
+      Type: AWS::EC2::VPNGateway
+      Condition: ASN
+      Properties:
+        Type: ipsec.1 
+        Tags:
+          - Key: Name
+            Value: !Sub ${VPCName} Virtual Gateway
+
+
+    VPNConnection:
+      Type: AWS::EC2::VPNConnection
+      Condition: VPNIP&ASN
+      Properties:
+        CustomerGatewayId: !Ref CustomerGateway
+        Type: ipsec.1
+        VpnGatewayId: !Ref VirtualPrivateGateway
+        Tags:
+          - Key: Name
+            Value: !Sub ${VPCName} VPN Connection
+
+
+    VPCGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Condition: ASN
+      Properties: 
+        VpcId: !Ref VPC
+        VpnGatewayId: !Ref VirtualPrivateGateway
+
+
+###########
+# Outputs #
+###########
+
+Outputs:
+    VpcId:
+        Description: VPC ID
+        Value: !Ref VPC
+        Export:
+            Name: !Sub ${AWS::StackName}-VpcId
+
+    PublicSubnetA:
+        Condition: PublicSubnets
+        Description: Public Subnet A ID
+        Value: !Ref PublicSubnetA
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetA
+
+    PublicSubnetB:
+        Condition: PublicSubnets
+        Description: Public Subnet B ID
+        Value: !Ref PublicSubnetB
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetB
+
+    PublicSubnetC:
+        Condition: PublicSubnets
+        Description: Public Subnet C ID
+        Value: !Ref PublicSubnetC
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetC
+
+    PrivateSubnetA:
+        Description: Private Subnet A ID
+        Value: !Ref PrivateSubnetA
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetA
+
+    PrivateSubnetB:
+        Description: Private Subnet B ID
+        Value: !Ref PrivateSubnetB
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetB
+
+    PrivateSubnetC:
+        Description: Private Subnet C ID
+        Value: !Ref PrivateSubnetC
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetC
+
+    SecurityGroupVPCEndpoint:
+        Condition: SSMEndpoints
+        Description: SecurityGroupVPCEndpoint
+        Value: !Ref SecurityGroupVPCEndpoint
+        Export:
+            Name: !Sub ${AWS::StackName}-SecurityGroupVPCEndpoint
+
+    VPNConnectionId:
+        Description: VPN Connection ID
+        Condition: VPNIP&ASN
+        Value: !Ref VPNConnection
+
+    VirutalPrivateGateway:
+        Description: VGW ID
+        Condition: ASN
+        Value: !Ref VirtualPrivateGateway
+
+    EC2Instance:
+        Description: EC2 instance
+        Condition: CreateEC2Instance
+        Value: !Ref EC2Instance
+
+
+
+# vim: set expandtab ts=4 sw=4 softtabstop=4 smartindent:
+...
